@@ -163,6 +163,17 @@
  *   learnings prune --older-than <dur>   Remove entries older than duration (e.g. 90d)
  *   learnings delete <id>                Delete a learning by ID
  *
+ * Loop Extension Point Queries (ADR-857 phase 3c):
+ *   loop render-hooks <point>            Resolve + render active Capability hooks at a loop point
+ *                                        Returns JSON envelope { point, activeHooks, rendered }
+ *                                        Valid points: discuss:pre/post, plan:pre/post,
+ *                                        execute:pre/wave:pre/wave:post/post, verify:pre/post, ship:pre/post
+ *
+ * Capability State (ADR-857 phase 4b):
+ *   capability state [--config-dir <path>]  Resolve per-capability install/surface/hook-activation state
+ *                                           Returns JSON envelope { runtimeConfigDir, capabilities[] }
+ *                                           --config-dir: runtime config dir (default: auto-detect current runtime)
+ *
  * GSD-2 Migration:
  *   from-gsd2 [--path <dir>] [--force] [--dry-run]
  *             Import a GSD-2 (.gsd/) project back to GSD v1 (.planning/) format
@@ -170,6 +181,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ExitError, runMain } = require('./lib/cli-exit.cjs');
 const core = require('./lib/core.cjs');
 const { error, ERROR_REASON } = core;
 // Resolve findProjectRoot lazily at call time rather than binding it at module
@@ -197,7 +209,11 @@ const learnings = require('./lib/learnings.cjs');
 const gapChecker = require('./lib/gap-checker.cjs');
 const { routeStateCommand } = require('./lib/state-command-router.cjs');
 const { routeVerifyCommand } = require('./lib/verify-command-router.cjs');
+const { routeVerificationCommand } = require('./lib/verification-command-router.cjs');
+const verification = require('./lib/verification.cjs');
 const { routeInitCommand } = require('./lib/init-command-router.cjs');
+const loopResolver = require('./lib/loop-resolver.cjs');
+const capabilityState = require('./lib/capability-state.cjs');
 const { routePhaseCommand } = require('./lib/phase-command-router.cjs');
 const { routePhasesCommand } = require('./lib/phases-command-router.cjs');
 const { routeValidateCommand } = require('./lib/validate-command-router.cjs');
@@ -238,6 +254,122 @@ function _dispatchNonFamily({ registryCommand, registryArgs, legacyCommand, lega
   void error;
   void output;
   return false;
+}
+
+// ─── ADR-959: Capability Command Dispatch ─────────────────────────────────────
+
+/**
+ * Dispatch a command via the capability registry's commandFamilies index.
+ *
+ * Consulted in the `default` case of `runCommand` BEFORE the unknown-command
+ * error is emitted. Returns:
+ *   true  — command was "consumed" (found in registry, or a dispatch error was
+ *            emitted); "Unknown command" is suppressed in all consumed cases.
+ *   false — command not found in the registry (including prototype-pollution
+ *            guard hits and missing/empty commandFamilies); caller falls through
+ *            to the existing unknown-command error path.
+ * Behavior-preserving when commandFamilies is empty ({}).
+ *
+ * Injectable for tests:
+ * - `registry` defaults to require('./lib/capability-registry.cjs')
+ * - `requireModule` defaults to a confinement-checked loader that resolves the
+ *   module path relative to bin/lib/ and asserts it stays within that directory
+ *   before requiring — defense-in-depth against corrupted/hand-edited registry entries.
+ *
+ * @param {object}   opts
+ * @param {string}   opts.command        The command name (top-level gsd-tools command)
+ * @param {string[]} opts.args           Remaining args passed to the router
+ * @param {string}   opts.cwd            Project working directory
+ * @param {boolean}  opts.raw            Raw output mode flag
+ * @param {Function} opts.error          Error reporter (core.error)
+ * @param {object}   [opts.registry]     Injectable registry (for tests)
+ * @param {Function} [opts.requireModule] Injectable module loader (for tests)
+ * @returns {boolean} true if the command was dispatched, false otherwise
+ */
+function dispatchCapabilityCommand({ command, args, cwd, raw, error, registry, requireModule }) {
+  // Prototype-pollution guard: reject reserved property names as command keys
+  if (command === '__proto__' || command === 'constructor' || command === 'prototype') {
+    return false;
+  }
+
+  // Resolve defaults (injectable for tests)
+  const reg = registry !== undefined ? registry : require('./lib/capability-registry.cjs');
+
+  // Default requireModule: confined to bin/lib/ — validate the module name is a
+  // safe bare .cjs basename (no path separators, no directory traversal), then
+  // resolve and assert confinement, then require the RESOLVED absolute path so
+  // the checked representation and the required representation are identical.
+  const libDir = path.join(__dirname, 'lib');
+  const defaultRequireModule = function (m) {
+    // Step 1: validate m is a bare .cjs basename — same conservative pattern the
+    // generator uses. Rejects any value with path separators (/, \, ..) or
+    // missing the .cjs extension before we even touch the filesystem.
+    if (typeof m !== 'string' || !/^[A-Za-z0-9._-]+\.cjs$/.test(m)) {
+      throw new Error('capability module must be a bare .cjs basename: ' + JSON.stringify(m));
+    }
+    // Step 2: confinement check — belt-and-suspenders even after the basename
+    // validation above. Resolved path must be inside libDir (not equal to it,
+    // and must start with libDir + sep so "libDir-suffix" can't sneak through).
+    const resolved = path.resolve(libDir, m);
+    if (resolved === libDir || !resolved.startsWith(libDir + path.sep)) {
+      throw new Error('capability module path escapes bin/lib/: ' + JSON.stringify(m));
+    }
+    // Step 3: require the resolved absolute path — the SAME representation that
+    // was checked above, not the concatenated './lib/' + m string.
+    return require(resolved);
+  };
+  const loadModule = requireModule !== undefined ? requireModule : defaultRequireModule;
+
+  // Look up the command family in the registry
+  const families = reg && reg.commandFamilies;
+  if (!families || typeof families !== 'object') return false;
+
+  const entry = families[command];
+  if (!entry || typeof entry !== 'object') return false;
+
+  // Resolve and call the router
+  let mod;
+  try {
+    mod = loadModule(entry.module);
+  } catch (_) {
+    // Module not found, load error, or confinement violation — surface a
+    // diagnostic and return true (consumed) so "Unknown command" is suppressed.
+    error('capability command "' + command + '" module "' + entry.module + '" failed to load');
+    return true; // consumed — don't emit "Unknown command"
+  }
+
+  // Own-property guard: prevent invoking inherited prototype methods
+  // (constructor, toString, hasOwnProperty, etc.) as a router when the registry
+  // entry names one of those. Must come before the typeof check.
+  if (!mod || !Object.prototype.hasOwnProperty.call(mod, entry.router)) {
+    error('capability command "' + command + '" router "' + entry.router + '" is not an own export of module "' + entry.module + '"');
+    return true; // consumed — don't emit "Unknown command"
+  }
+  const fn = mod[entry.router];
+  if (typeof fn !== 'function') {
+    // Router export not found — surface a diagnostic and return true (consumed)
+    // so "Unknown command" is suppressed.
+    error('capability command "' + command + '" router "' + entry.router + '" is not a function in module "' + entry.module + '"');
+    return true; // consumed — don't emit "Unknown command"
+  }
+
+  let _result;
+  try {
+    _result = fn({ args, cwd, raw, error });
+  } catch (e) {
+    if (e instanceof ExitError) throw e; // intentional structured error from the router (honors --json-errors) — propagate untouched
+    error(
+      'capability command "' + command + '" router "' + entry.router + '" in module "' + entry.module + '" threw: ' + (e && e.message ? e.message : String(e)),
+      ERROR_REASON.SDK_FAIL_FAST,
+    );
+  }
+  if (_result && typeof _result.then === 'function') {
+    error(
+      'capability command "' + command + '" router "' + entry.router + '" in module "' + entry.module + '" must be synchronous (returned a Promise); async capability routers are not supported.',
+      ERROR_REASON.SDK_FAIL_FAST,
+    );
+  }
+  return true;
 }
 
 // ─── Arg parsing helpers ──────────────────────────────────────────────────────
@@ -298,13 +430,11 @@ async function main() {
 
   // Optional workstream override for parallel milestone work.
   // Priority: --ws flag > GSD_WORKSTREAM env var > session/shared pointer > null.
-  let ws = null;
   let workstreamContext = null;
   try {
     workstreamContext = resolveActiveWorkstream(cwd, args, process.env, {
       getStored: getActiveWorkstream,
     });
-    ws = workstreamContext.ws;
     args = workstreamContext.args;
     // Set env var so all modules (planningDir, planningPaths) auto-resolve workstream paths.
     applyResolvedWorkstreamEnv(workstreamContext, process.env);
@@ -378,8 +508,8 @@ async function main() {
     'current-timestamp, detect-custom-files, docs-init, effort, extract-messages, find-phase, ' +
     'from-gsd2, frontmatter, gap-analysis, generate-claude-md, generate-claude-profile, ' +
     'generate-dev-preferences, generate-slug, graphify, history-digest, init, intel, ' +
-    'learnings, list-todos, milestone, phase, phase-plan-index, phases, profile-questionnaire, ' +
-    'profile-sample, progress, prompt-budget, requirements, resolve-granularity, resolve-model, roadmap, scaffold, state, ' +
+    'capability, classify-confidence, learnings, list-todos, loop, milestone, package-legitimacy, phase, phase-plan-index, phases, profile-questionnaire, ' +
+    'profile-sample, progress, prompt-budget, requirements, research-plan, research-store, resolve-granularity, resolve-model, roadmap, scaffold, state, ' +
     'task, template, validate, verify, verify-path-exists, verify-summary, workstream, worktree\n\n' +
     'Global flags:\n' +
     '  --raw              Emit raw output without post-processing\n' +
@@ -419,10 +549,16 @@ async function main() {
   // Multi-repo guard: resolve project root for commands that read/write .planning/.
   // Skip for pure-utility commands that don't touch .planning/ to avoid unnecessary
   // filesystem traversal on every invocation.
+  // 'loop' and 'capability' are intentionally NOT in SKIP_ROOT_RESOLUTION.
+  // Both are registry/config queries that resolve activation via
+  // .planning/config.json; they need the project root (cwd) for correct
+  // `when` key resolution. If one is ever moved to SKIP_ROOT_RESOLUTION,
+  // move the other at the same time (keep them consistent).
   const SKIP_ROOT_RESOLUTION = new Set([
     'generate-slug', 'current-timestamp', 'verify-path-exists',
     'verify-summary', 'template', 'frontmatter', 'detect-custom-files',
     'worktree', 'prompt-budget',
+    'research-store', 'research-plan', 'package-legitimacy', 'classify-confidence',
   ]);
   if (!SKIP_ROOT_RESOLUTION.has(command)) {
     cwd = findProjectRoot(cwd);
@@ -547,7 +683,22 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
     }
 
     case 'resolve-granularity': {
-      commands.cmdResolveGranularity(cwd, args[1], raw);
+      // Parse optional --granularity <val> flag (space form only); positional is phase-type.
+      // The =form (--granularity=<val>) is intentionally not supported: parseNamedArgs and
+      // the /gsd:plan-phase + init plan-phase paths accept only the space form, so supporting
+      // = here alone would create an inconsistency (#703).
+      const granArgs = args.slice(1);
+      let granOverride;
+      const granPositionals = [];
+      for (let i = 0; i < granArgs.length; i++) {
+        const a = granArgs[i];
+        if (a === '--granularity' && granArgs[i + 1] !== undefined && !granArgs[i + 1].startsWith('--')) {
+          if (granOverride === undefined) { granOverride = granArgs[++i]; } else { ++i; }
+        } else {
+          granPositionals.push(a);
+        }
+      }
+      commands.cmdResolveGranularity(cwd, granPositionals[0], raw, granOverride);
       break;
     }
 
@@ -753,6 +904,26 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
     case 'verify': {
       routeVerifyCommand({
         verify,
+        args,
+        cwd,
+        raw,
+        error,
+      });
+      break;
+    }
+
+    // ─── Verification Status ───────────────────────────────────────────────
+    //
+    // verification status <phaseDir>
+    //   Read the first *-VERIFICATION.md in phaseDir and return
+    //   { status, next_action, next_command } routing result.
+    //
+    // Note: `verification` (reads verifier-emitted status) is distinct from
+    // `verify` (runs verification checks like plan-structure/artifacts).
+
+    case 'verification': {
+      routeVerificationCommand({
+        verification,
         args,
         cwd,
         raw,
@@ -984,7 +1155,8 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       if (subcommand === 'complete') {
         const milestoneName = parseMultiwordArg(args, 'name');
         const archivePhases = args.includes('--archive-phases');
-        milestone.cmdMilestoneComplete(cwd, args[2], { name: milestoneName, archivePhases }, raw);
+        const force = args.includes('--force');
+        milestone.cmdMilestoneComplete(cwd, args[2], { name: milestoneName, archivePhases, force }, raw);
       } else {
         error('Unknown milestone subcommand. Available: complete', ERROR_REASON.SDK_UNKNOWN_COMMAND);
       }
@@ -1006,27 +1178,6 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
     case 'progress': {
       const subcommand = args[1] || 'json';
       commands.cmdProgressRender(cwd, subcommand, raw);
-      break;
-    }
-
-    case 'audit-uat': {
-      const uat = require('./lib/uat.cjs');
-      uat.cmdAuditUat(cwd, raw);
-      break;
-    }
-
-    case 'audit-open': {
-      const { auditOpenArtifacts, formatAuditReport } = require('./lib/audit.cjs');
-      const wantJson = args.includes('--json');
-      const result = auditOpenArtifacts(cwd);
-      if (wantJson) {
-        // core.output JSON-stringifies its first arg; pass the object directly.
-        core.output(result, raw);
-      } else {
-        // Human-readable report must bypass JSON encoding — use the rawValue
-        // form (third arg) which core.output emits verbatim.
-        core.output(null, true, formatAuditReport(result));
-      }
       break;
     }
 
@@ -1078,6 +1229,50 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         raw,
         error,
       });
+      break;
+    }
+
+    case 'loop': {
+      // loop render-hooks <point>
+      const loopSubcommand = args[1];
+      if (loopSubcommand === 'render-hooks') {
+        loopResolver.cmdLoopRenderHooks(cwd, args[2], raw, {});
+      } else {
+        error(
+          `Unknown loop subcommand: ${loopSubcommand}. Available: render-hooks`,
+          core.ERROR_REASON ? core.ERROR_REASON.SDK_UNKNOWN_COMMAND : undefined,
+        );
+      }
+      break;
+    }
+
+    case 'capability': {
+      // capability state [--config-dir <path>]
+      // Root resolution: 'capability' is NOT in SKIP_ROOT_RESOLUTION for the
+      // same reason 'loop' is not: both are registry/config queries that need
+      // the project root (cwd) for .planning/config.json activation resolution.
+      // If 'loop' were ever added to SKIP_ROOT_RESOLUTION, 'capability' should
+      // be added at the same time to keep them consistent.
+      const capSubcommand = args[1];
+      if (capSubcommand === 'state') {
+        const configDirIdx = args.indexOf('--config-dir');
+        let configDir = null;
+        if (configDirIdx !== -1) {
+          const configDirVal = args[configDirIdx + 1];
+          // Validate that --config-dir has a following non-flag value.
+          if (!configDirVal || configDirVal.startsWith('--')) {
+            error('Missing value for --config-dir', core.ERROR_REASON ? core.ERROR_REASON.USAGE : undefined);
+          }
+          configDir = configDirVal;
+        }
+        const resolvedConfigDir = configDir ? path.resolve(configDir) : null;
+        capabilityState.cmdCapabilityState(cwd, resolvedConfigDir, raw, {});
+      } else {
+        error(
+          `Unknown capability subcommand: ${capSubcommand}. Available: state`,
+          core.ERROR_REASON ? core.ERROR_REASON.SDK_UNKNOWN_COMMAND : undefined,
+        );
+      }
       break;
     }
 
@@ -1232,85 +1427,12 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         worktreeSafety.cmdWorktreeCleanupWave(cwd, args.slice(2));
       } else if (subcommand === 'reap-orphans') {
         worktreeSafety.cmdWorktreeReapOrphans(cwd);
+      } else if (subcommand === 'base-check') {
+        require('./lib/worktree-base-ref.cjs').cmdWorktreeBaseCheck(cwd, args.slice(2));
+      } else if (subcommand === 'set-baseref') {
+        require('./lib/worktree-base-ref.cjs').cmdWorktreeSetBaseRef(cwd, args.slice(2));
       } else {
-        error('Unknown worktree subcommand. Available: cleanup-wave, reap-orphans', ERROR_REASON.SDK_UNKNOWN_COMMAND);
-      }
-      break;
-    }
-
-    // ─── Intel ────────────────────────────────────────────────────────────
-
-    case 'intel': {
-      const intel = require('./lib/intel.cjs');
-      const subcommand = args[1];
-      if (subcommand === 'query') {
-        const term = args[2];
-        if (!term) error('Usage: gsd-tools intel query <term>', ERROR_REASON.USAGE);
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelQuery(term, planningDir), raw);
-      } else if (subcommand === 'status') {
-        const planningDir = path.join(cwd, '.planning');
-        const status = intel.intelStatus(planningDir);
-        if (!raw && status.files) {
-          for (const file of Object.values(status.files)) {
-            if (file.updated_at) {
-              file.updated_at = core.timeAgo(new Date(file.updated_at));
-            }
-          }
-        }
-        core.output(status, raw);
-      } else if (subcommand === 'diff') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelDiff(planningDir), raw);
-      } else if (subcommand === 'snapshot') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelSnapshot(planningDir), raw);
-      } else if (subcommand === 'patch-meta') {
-        const filePath = args[2];
-        if (!filePath) error('Usage: gsd-tools intel patch-meta <file-path>', ERROR_REASON.USAGE);
-        core.output(intel.intelPatchMeta(path.resolve(cwd, filePath)), raw);
-      } else if (subcommand === 'validate') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelValidate(planningDir), raw);
-      } else if (subcommand === 'extract-exports') {
-        const filePath = args[2];
-        if (!filePath) error('Usage: gsd-tools intel extract-exports <file-path>', ERROR_REASON.USAGE);
-        core.output(intel.intelExtractExports(path.resolve(cwd, filePath)), raw);
-      } else if (subcommand === 'update') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelUpdate(planningDir), raw);
-      } else if (subcommand === 'api-surface') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelApiSurface(planningDir), raw);
-      } else {
-        error('Unknown intel subcommand. Available: query, status, update, diff, snapshot, patch-meta, validate, extract-exports, api-surface', ERROR_REASON.SDK_UNKNOWN_COMMAND);
-      }
-      break;
-    }
-
-    // ─── Graphify ──────────────────────────────────────────────────────────
-
-    case 'graphify': {
-      const graphify = require('./lib/graphify.cjs');
-      const subcommand = args[1];
-      if (subcommand === 'query') {
-        const term = args[2];
-        if (!term) error('Usage: gsd-tools graphify query <term>', ERROR_REASON.USAGE);
-        const budgetIdx = args.indexOf('--budget');
-        const budget = budgetIdx !== -1 ? parseInt(args[budgetIdx + 1], 10) : null;
-        core.output(graphify.graphifyQuery(cwd, term, { budget }), raw);
-      } else if (subcommand === 'status') {
-        core.output(graphify.graphifyStatus(cwd), raw);
-      } else if (subcommand === 'diff') {
-        core.output(graphify.graphifyDiff(cwd), raw);
-      } else if (subcommand === 'build') {
-        if (args[2] === 'snapshot') {
-          core.output(graphify.writeSnapshot(cwd), raw);
-        } else {
-          core.output(graphify.graphifyBuild(cwd), raw);
-        }
-      } else {
-        error('Unknown graphify subcommand. Available: build, query, status, diff', ERROR_REASON.SDK_UNKNOWN_COMMAND);
+        error('Unknown worktree subcommand. Available: cleanup-wave, reap-orphans, base-check, set-baseref', ERROR_REASON.SDK_UNKNOWN_COMMAND);
       }
       break;
     }
@@ -1528,33 +1650,26 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
 
       // ── Validate required args ─────────────────────────────────────────
       if (!budgetStr) {
-        process.stderr.write('Error: --budget <N> is required\n');
-        process.exit(1);
+        throw new ExitError(1, 'Error: --budget <N> is required');
       }
       const budget = parseInt(budgetStr, 10);
       if (!Number.isFinite(budget) || budget <= 0) {
-        process.stderr.write('Error: --budget must be a positive integer\n');
-        process.exit(1);
+        throw new ExitError(1, 'Error: --budget must be a positive integer');
       }
       if (!instructionsFile) {
-        process.stderr.write('Error: --instructions-file <path> is required\n');
-        process.exit(1);
+        throw new ExitError(1, 'Error: --instructions-file <path> is required');
       }
       if (!roadmapFile) {
-        process.stderr.write('Error: --roadmap-file <path> is required\n');
-        process.exit(1);
+        throw new ExitError(1, 'Error: --roadmap-file <path> is required');
       }
       if (planFiles.length === 0) {
-        process.stderr.write('Error: at least one --plan-file <path> is required\n');
-        process.exit(1);
+        throw new ExitError(1, 'Error: at least one --plan-file <path> is required');
       }
       if (!outputPromptFile) {
-        process.stderr.write('Error: --output-prompt <path> is required\n');
-        process.exit(1);
+        throw new ExitError(1, 'Error: --output-prompt <path> is required');
       }
       if (!outputMetadataFile) {
-        process.stderr.write('Error: --output-metadata <path> is required\n');
-        process.exit(1);
+        throw new ExitError(1, 'Error: --output-metadata <path> is required');
       }
 
       // ── Validate and read required files ──────────────────────────────
@@ -1564,11 +1679,9 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
           return await fs.promises.readFile(resolved, 'utf8');
         } catch (err) {
           if (err && err.code === 'ENOENT') {
-            process.stderr.write(`Error: file not found for ${flagName}: ${resolved}\n`);
-            process.exit(1);
+            throw new ExitError(1, `Error: file not found for ${flagName}: ${resolved}`);
           }
-          process.stderr.write(`Error: cannot read file for ${flagName}: ${resolved}\n`);
-          process.exit(1);
+          throw new ExitError(1, `Error: cannot read file for ${flagName}: ${resolved}`);
         }
       }
 
@@ -1579,8 +1692,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
           return await fs.promises.readFile(resolved, 'utf8');
         } catch (err) {
           if (err && err.code === 'ENOENT') return null;
-          process.stderr.write(`Error: cannot read optional file: ${resolved}\n`);
-          process.exit(1);
+          throw new ExitError(1, `Error: cannot read optional file: ${resolved}`);
         }
       }
 
@@ -1593,11 +1705,9 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
           return { file: path.basename(p), content };
         } catch (err) {
           if (err && err.code === 'ENOENT') {
-            process.stderr.write(`Error: plan file not found: ${resolved}\n`);
-            process.exit(1);
+            throw new ExitError(1, `Error: plan file not found: ${resolved}`);
           }
-          process.stderr.write(`Error: cannot read plan file: ${resolved}\n`);
-          process.exit(1);
+          throw new ExitError(1, `Error: cannot read plan file: ${resolved}`);
         }
       }));
 
@@ -1626,7 +1736,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       await fs.promises.writeFile(path.resolve(outputPromptFile), prompt);
 
       if (metadata.hardFailed) {
-        process.exit(2);
+        throw new ExitError(2);
       }
       break;
     }
@@ -1660,6 +1770,183 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       }
       const ctx = loadUpdateContext({ preferredConfigDir, preferredRuntime });
       process.stdout.write(JSON.stringify(ctx) + '\n');
+      break;
+    }
+
+    // ─── Research Store ────────────────────────────────────────────────────
+    //
+    // research-store get <key> [--kind <k>]
+    //   -> getResearch(cwd, key, { homeDir }); searches both tiers; core.output(result, raw)
+    //   (--kind is accepted for backward compatibility but no longer drives tier selection)
+    // research-store put <key> --content <str> --source <s> --provider <p>
+    //                           --confidence <c> --kind <k>
+    //   -> putResearch(cwd, key, { content, source, provider, confidence, kind })
+    //
+    // Tier is derived from source: 'curated' source writes to process.env.HOME/.gsd/research-cache;
+    // all other sources write to cwd/.planning/research/.cache.
+    // Tests may override the home directory by setting the HOME env var.
+
+    case 'research-store': {
+      const researchStore = require('./lib/research-store.cjs');
+      const subcommand = args[1];
+      const homeDir = process.env.HOME || require('os').homedir();
+      if (subcommand === 'get') {
+        const key = args[2];
+        if (!key || key.startsWith('--')) {
+          error('Usage: gsd-tools research-store get <key> [--kind <k>]', ERROR_REASON.USAGE);
+        }
+        if (!researchStore.isValidResearchKey(key)) {
+          error('research-store: <key> must be a 64-char sha256 hex (use research-plan to obtain keys)', ERROR_REASON.USAGE);
+        }
+        // --kind is accepted but no longer drives tier selection; getResearch searches both tiers
+        const result = researchStore.getResearch(cwd, key, { homeDir });
+        core.output(result, raw);
+      } else if (subcommand === 'put') {
+        const key = args[2];
+        if (!key || key.startsWith('--')) {
+          error('Usage: gsd-tools research-store put <key> --content <str> --source <s> --provider <p> --confidence <c> --kind <k>', ERROR_REASON.USAGE);
+        }
+        if (!researchStore.isValidResearchKey(key)) {
+          error('research-store: <key> must be a 64-char sha256 hex (use research-plan to obtain keys)', ERROR_REASON.USAGE);
+        }
+        const contentIdx = args.indexOf('--content');
+        const sourceIdx = args.indexOf('--source');
+        const providerIdx = args.indexOf('--provider');
+        const confidenceIdx = args.indexOf('--confidence');
+        const kindIdx = args.indexOf('--kind');
+        // For each flag, if the following value is missing or itself starts with '--', reject.
+        function getFlagValue(idx, flagName) {
+          if (idx === -1) return null;
+          const val = args[idx + 1];
+          if (val === undefined || val.startsWith('--')) {
+            error(`research-store put: missing value for ${flagName}`, ERROR_REASON.USAGE);
+          }
+          return val;
+        }
+        const content = getFlagValue(contentIdx, '--content');
+        const source = getFlagValue(sourceIdx, '--source');
+        const provider = getFlagValue(providerIdx, '--provider');
+        const confidence = getFlagValue(confidenceIdx, '--confidence');
+        const kind = getFlagValue(kindIdx, '--kind');
+        if (!content || !source || !provider || !confidence || !kind) {
+          error('Usage: gsd-tools research-store put <key> --content <str> --source <s> --provider <p> --confidence <c> --kind <k>', ERROR_REASON.USAGE);
+        }
+        const entry = researchStore.putResearch(cwd, key, { content, source, provider, confidence, kind }, { homeDir });
+        core.output(entry, raw);
+      } else {
+        error('Unknown research-store subcommand. Available: get, put', ERROR_REASON.SDK_UNKNOWN_COMMAND);
+      }
+      break;
+    }
+
+    // ─── Research Plan ─────────────────────────────────────────────────────
+    //
+    // research-plan --input <path>
+    //   Read+JSON.parse file; call planResearch({ questions, ecosystem, config, cwd })
+    //   { ecosystem, config, questions: [{ text, kind, library?, version? }] }
+
+    case 'research-plan': {
+      const researchProvider = require('./lib/research-provider.cjs');
+      const inputIdx = args.indexOf('--input');
+      const inputPath = inputIdx !== -1 ? args[inputIdx + 1] : null;
+      if (!inputPath || inputPath.startsWith('--')) {
+        error('Usage: gsd-tools research-plan --input <path>', ERROR_REASON.USAGE);
+      }
+      let planInput;
+      try {
+        const raw_ = fs.readFileSync(path.resolve(inputPath), 'utf8');
+        planInput = JSON.parse(raw_);
+      } catch (readErr) {
+        error(`research-plan: cannot read/parse --input file: ${inputPath}`, ERROR_REASON.USAGE);
+      }
+      if (planInput === null || typeof planInput !== 'object' || Array.isArray(planInput)) {
+        error('research-plan: --input must be an object with a questions array', ERROR_REASON.USAGE);
+      }
+      if (!Array.isArray(planInput.questions)) {
+        error('research-plan: --input must be an object with a questions array', ERROR_REASON.USAGE);
+      }
+      const { ecosystem = '', config: planConfig = {}, questions } = planInput;
+      const homeDir = process.env.HOME || require('os').homedir();
+      const plan = researchProvider.planResearch({ questions, ecosystem, config: planConfig, cwd, homeDir });
+      core.output(plan, raw);
+      break;
+    }
+
+    // ─── Classify Confidence ──────────────────────────────────────────────
+    //
+    // classify-confidence --provider <id> [--package <name> --ecosystem <npm|pypi|crates>] [--verified]
+    //   -> classifyConfidence({ provider, verifiedAgainstOfficial, legitimacyVerdict }); core.output(result, raw)
+    //
+    // legitimacyVerdict is CODE-COMPUTED via checkPackages — never caller-supplied — so an agent cannot self-assert OK→HIGH.
+
+    case 'classify-confidence': {
+      const researchProvider = require('./lib/research-provider.cjs');
+      const providerIdx = args.indexOf('--provider');
+      const provider = providerIdx !== -1 ? args[providerIdx + 1] : null;
+      if (!provider || provider.startsWith('--')) {
+        error('Usage: gsd-tools query classify-confidence --provider <id> [--package <name> --ecosystem <npm|pypi|crates>] [--verified]', ERROR_REASON.USAGE);
+      }
+      const verified = args.includes('--verified');
+      const pkgIdx = args.indexOf('--package');
+      const pkg = pkgIdx !== -1 ? args[pkgIdx + 1] : null;
+      const ecoIdx = args.indexOf('--ecosystem');
+      const ecosystem = ecoIdx !== -1 ? args[ecoIdx + 1] : null;
+      let legitimacyVerdict = null;
+      if (pkg && (!pkg.startsWith('--'))) {
+        const VALID_ECOSYSTEMS = new Set(['npm', 'pypi', 'crates']);
+        if (!ecosystem || ecosystem.startsWith('--') || !VALID_ECOSYSTEMS.has(ecosystem)) {
+          error('Usage: gsd-tools query classify-confidence --provider <id> [--package <name> --ecosystem <npm|pypi|crates>] [--verified]', ERROR_REASON.USAGE);
+        }
+        const pkgLegitimacy = require('./lib/package-legitimacy.cjs');
+        const results = await pkgLegitimacy.checkPackages({ ecosystem, packages: [pkg] }, {});
+        legitimacyVerdict = results[0] ? results[0].verdict : null;
+      }
+      const confidence = researchProvider.classifyConfidence({ provider, verifiedAgainstOfficial: verified, legitimacyVerdict });
+      core.output({ provider, package: pkg || null, ecosystem: ecosystem || null, legitimacyVerdict, verified, confidence }, raw);
+      break;
+    }
+
+    // ─── Package Legitimacy ────────────────────────────────────────────────
+    //
+    // package-legitimacy check --ecosystem <eco> <pkg1> <pkg2> ...
+    //
+    // checkPackages is ASYNC. This entire runCommand function is async, so
+    // we can await directly. On rejection we call error() which exits.
+
+    case 'package-legitimacy': {
+      const pkgLegitimacy = require('./lib/package-legitimacy.cjs');
+      const subcommand = args[1];
+      if (subcommand !== 'check') {
+        error('Unknown package-legitimacy subcommand. Available: check', ERROR_REASON.SDK_UNKNOWN_COMMAND);
+      }
+      const ecoIdx = args.indexOf('--ecosystem');
+      const ecosystem = ecoIdx !== -1 ? args[ecoIdx + 1] : null;
+      const VALID_ECOSYSTEMS = new Set(['npm', 'pypi', 'crates']);
+      if (!ecosystem || !VALID_ECOSYSTEMS.has(ecosystem)) {
+        error('Usage: gsd-tools package-legitimacy check --ecosystem <npm|pypi|crates> <pkg1> ...', ERROR_REASON.USAGE);
+      }
+      // Collect positional package names.
+      // Only --ecosystem takes a value. Every non-flag arg is a package name.
+      // Any unknown --flag is a usage error (do not silently skip+consume the next arg).
+      const packages = [];
+      for (let i = 2; i < args.length; i++) {
+        const a = args[i];
+        if (a === '--ecosystem') { i++; continue; }
+        if (a.startsWith('--')) {
+          error(`package-legitimacy: unknown flag ${a}`, ERROR_REASON.USAGE);
+        }
+        packages.push(a);
+      }
+      if (packages.length === 0) {
+        error('Usage: gsd-tools package-legitimacy check --ecosystem <eco> <pkg1> <pkg2> ...', ERROR_REASON.USAGE);
+      }
+      let pkgResults;
+      try {
+        pkgResults = await pkgLegitimacy.checkPackages({ ecosystem, packages }, {});
+      } catch (pkgErr) {
+        error(`package-legitimacy: ${pkgErr && pkgErr.message ? pkgErr.message : String(pkgErr)}`, ERROR_REASON.UNKNOWN);
+      }
+      core.output(pkgResults, raw);
       break;
     }
 
@@ -1698,6 +1985,14 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
     }
 
     default: {
+      // ADR-959: try capability-registry dispatch before emitting the unknown-command error.
+      // An unmigrated command still hits its hardcoded `case` above — untouched.
+      // A migrated command's `case` is removed at cutover, so it reaches here and
+      // dispatchCapabilityCommand routes it to the capability's registered router.
+      // commandFamilies now includes migrated capabilities (e.g. graphify → graphify-command-router.cjs);
+      // this returns true when a registered capability owns the command, false otherwise.
+      if (dispatchCapabilityCommand({ command, args, cwd, raw, error })) break;
+
       // #3243: if the caller passed a dotted form (e.g. "foo.bar"), the shim
       // above split it so `command` here is the head ("foo"). Use
       // originalCommand to reconstruct the original dotted form and suggest
@@ -1719,4 +2014,12 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
   }
 }
 
-main();
+// ─── CLI entry point ──────────────────────────────────────────────────────────
+if (require.main === module) {
+  runMain(main);
+}
+
+// ─── Exports (for tests) ──────────────────────────────────────────────────────
+// ADR-959: export dispatchCapabilityCommand so tests can exercise it with
+// synthetic registry + requireModule injections.
+module.exports = { dispatchCapabilityCommand };

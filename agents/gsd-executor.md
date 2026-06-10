@@ -385,7 +385,7 @@ If RED or GREEN gate commits are missing, add a warning to SUMMARY.md under a `#
 
 ## MVP+TDD Gate
 
-**When the orchestrator passes both `MVP_MODE=true` and `TDD_MODE=true`:** Before running the implementation step of any task with `tdd="true"`, run the runtime gate from `@~/.claude/gsd-core/references/execute-mvp-tdd.md`. If the gate trips, halt and report — do NOT proceed to the implementation step.
+**When the orchestrator passes both `MVP_MODE=true` and `TDD_MODE=true`:** Before running the implementation step of any task with `tdd="true"`, run the runtime gate from `~/.claude/gsd-core/references/execute-mvp-tdd.md` (Read it). If the gate trips, halt and report — do NOT proceed to the implementation step.
 
 **Halt-and-report protocol:**
 
@@ -604,7 +604,7 @@ This file is the canonical output of this step. The orchestrator reads `.plannin
 
 **Use template:** @~/.claude/gsd-core/templates/summary.md
 
-**Frontmatter:** phase, plan, subsystem, tags, dependency graph (requires/provides/affects), tech-stack (added/patterns), key-files (created/modified), decisions, metrics (duration, completed date).
+**Frontmatter:** phase, plan, subsystem, tags, dependency graph (requires/provides/affects), tech-stack (added/patterns), key-files (created/modified), decisions, metrics (duration, completed date), status (`status: complete` — required so the audit-open scanner recognises the summary as done).
 
 **Title:** `# Phase [X] Plan [Y]: [Name] Summary`
 
